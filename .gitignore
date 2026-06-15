@@ -1,0 +1,58 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.*
+
+# Package managers
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+bun.lockb
+
+# Build outputs
+.next/
+out/
+dist/
+build/
+coverage/
+.turbo/
+.vercel/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# TypeScript
+*.tsbuildinfo
+next-env.d.ts
+
+# Testing
+playwright-report/
+test-results/
+
+# Generated local data
+tmp/
+temp/
+.cache/
+
+# Secrets and keys
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+.vercel
