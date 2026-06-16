@@ -1,43 +1,58 @@
 // Transmission persistence sidecar.
 //
-// This module assembles an S3 key + DynamoDB record for a finished transmission
-// and writes them via injected `putObject` / `putItem` functions. It is called
+// Assembles an S3 key + an event-partitioned DynamoDB record for a finished
+// transmission, writes them via injected `putObject` / `putItem` functions, then
+// enqueues a transcription job via an injected `enqueue`. It is called
 // fire-and-forget from the relay AFTER the live fan-out has completed, so a slow
 // or failing AWS call can never backpressure or break the talking channel.
+//
+// Data model: the event is the ownership boundary. DynamoDB is a single table of
+// event operational memory (PK = EVENT#<eventId>); a transmission is one entity
+// type within it. See docs/slice2-store.md and the architecture doc.
 //
 // The AWS SDK is imported lazily (only when a real store is built from env), so
 // tests and local dev that use the noop store never touch the SDK or credentials.
 
-// S3 key scheme: channel/YYYY-MM-DD/transmissionId.mp4
-// Groups recordings by channel then day, which keeps prefixes scannable and
-// makes lifecycle/retention rules easy to express per channel or per day.
-export function s3Key({ channel, transmissionId, timestamp }) {
-  const date = new Date(timestamp).toISOString().slice(0, 10)
-  return `${channel}/${date}/${transmissionId}.mp4`
+import { createQueueFromEnv } from './queue.js'
+
+// S3 key scheme: <eventId>/<channelId>/<YYYY-MM-DD>/<transmissionId>.mp4
+// Partitioned by the ownership boundary (event) then channel then UTC day, which
+// keeps prefixes scannable and makes per-event/-channel/-day retention easy.
+export function s3Key({ eventId, channelId, transmissionId, endedAt }) {
+  const date = new Date(endedAt).toISOString().slice(0, 10)
+  return `${eventId}/${channelId}/${date}/${transmissionId}.mp4`
 }
 
-// Minimal single-table DynamoDB item. Partition by channel, sort by time so a
-// channel's transmissions read back chronologically (TX#<epochMs>#<id>).
+// One DynamoDB item: an EVENT#-partitioned TRANSMISSION entity, sorted by end
+// time so an event's transmissions read back chronologically. Audio bytes are
+// NEVER stored here — only the S3 pointer.
 export function buildRecord({
-  channel,
-  transmissionId,
-  timestamp,
-  duration,
+  eventId,
+  channelId,
   clientId,
+  relayId,
+  transmissionId,
+  startedAt,
+  endedAt,
+  durationMs,
   bucket,
   key,
   contentType,
   size,
 }) {
   return {
-    pk: `CHANNEL#${channel}`,
-    sk: `TX#${timestamp}#${transmissionId}`,
-    transmissionId,
-    channel,
-    timestamp: new Date(timestamp).toISOString(),
-    epochMs: timestamp,
-    durationMs: duration,
+    pk: `EVENT#${eventId}`,
+    sk: `TX#${endedAt}#${transmissionId}`,
+    entityType: 'TRANSMISSION',
+    schemaVersion: 1,
+    eventId,
+    channelId,
     clientId,
+    relayId,
+    transmissionId,
+    startedAt,
+    endedAt,
+    durationMs,
     s3Bucket: bucket,
     s3Key: key,
     contentType,
@@ -45,22 +60,32 @@ export function buildRecord({
   }
 }
 
-// Real store. `putObject`/`putItem` are injected so the persistence logic is
-// fully decoupled from (and testable without) the AWS SDK.
-export function createStore({ bucket, putObject, putItem }) {
+// Real store. `putObject`/`putItem`/`enqueue` are injected so the persistence
+// pipeline is fully decoupled from (and testable without) the AWS SDK.
+export function createStore({ bucket, putObject, putItem, enqueue = async () => {} }) {
   return {
     kind: 'aws',
     async persist(tx) {
       const key = s3Key(tx)
-      // Write the object first; the record points at it, so a dangling record
-      // (object missing) is worse than a dangling object (record missing).
+      // 1. S3 first: the record and the STT job both point at this object, so a
+      //    dangling pointer (object missing) is worse than an orphan object.
       await putObject({
         Bucket: bucket,
         Key: key,
         Body: tx.audio,
         ContentType: tx.contentType,
       })
-      await putItem(buildRecord({ ...tx, bucket, key }))
+      // 2. DynamoDB metadata record.
+      const record = buildRecord({ ...tx, bucket, key })
+      await putItem(record)
+      // 3. Hand off to the STT pipeline (workers consume the queue, not the DB).
+      await enqueue({
+        eventId: tx.eventId,
+        transmissionId: tx.transmissionId,
+        bucket,
+        key,
+      })
+      return record
     },
   }
 }
@@ -80,7 +105,8 @@ export function createNoopStore() {
 //
 //   MIRA_STORE       set to "noop" to force the local stub (overrides AWS config)
 //   MIRA_S3_BUCKET   target S3 bucket for transcoded audio
-//   MIRA_DDB_TABLE   target DynamoDB table for metadata records
+//   MIRA_DDB_TABLE   target DynamoDB table for event operational memory
+//   MIRA_SQS_QUEUE_URL  target SQS queue for transcription jobs (optional)
 //   AWS_REGION       AWS region (default us-east-1)
 //   AWS credentials  resolved by the default AWS SDK provider chain (never hardcoded)
 //
@@ -116,5 +142,12 @@ export function createStoreFromEnv(env = process.env) {
     return ddb.client.send(new ddb.PutCommand({ TableName: table, Item: item }))
   }
 
-  return createStore({ bucket: env.MIRA_S3_BUCKET, table, putObject, putItem })
+  const queue = createQueueFromEnv(env)
+
+  return createStore({
+    bucket: env.MIRA_S3_BUCKET,
+    putObject,
+    putItem,
+    enqueue: (job) => queue.enqueue(job),
+  })
 }

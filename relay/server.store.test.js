@@ -1,12 +1,12 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, afterEach } from 'vitest'
 import WebSocket from 'ws'
 import { createRelay } from './server.js'
 
-function connect(port, channelId) {
+function connect(port, { eventId, channelId } = {}) {
   return new Promise((resolve) => {
     const ws = new WebSocket(`ws://localhost:${port}`)
     ws.on('open', () => {
-      ws.send(JSON.stringify({ type: 'join', channelId }))
+      ws.send(JSON.stringify({ type: 'join', eventId, channelId }))
       setTimeout(() => resolve(ws), 20)
     })
   })
@@ -33,7 +33,6 @@ async function sendAudio(sender) {
   sender.send(JSON.stringify({ type: 'end' }))
 }
 
-// Deferred promise we resolve manually in tests
 function deferred() {
   let resolve
   const promise = new Promise((r) => { resolve = r })
@@ -51,49 +50,69 @@ describe('store sidecar', () => {
     port = wss.address().port
   }
 
-  it('hands the transmission to the writer with correct metadata', async () => {
+  it('hands the transmission to the writer with correct event-scoped metadata', async () => {
     const calls = []
     const store = { kind: 'test', persist: async (tx) => { calls.push(tx) } }
     await start(store)
 
-    const sender = await connect(port, 'ch1')
-    const receiver = await connect(port, 'ch1')
+    const sender = await connect(port, { eventId: 'event123', channelId: 'security' })
+    const receiver = await connect(port, { eventId: 'event123', channelId: 'security' })
     const incoming = nextMessages(receiver, 3)
     await sendAudio(sender)
     const msgs = await incoming
     const deliveredMp4 = msgs.find((m) => m.isBinary).data
 
-    // give the fire-and-forget sidecar a tick to run
-    await new Promise((r) => setTimeout(r, 50))
+    await new Promise((r) => setTimeout(r, 50)) // let the fire-and-forget sidecar run
 
     expect(calls).toHaveLength(1)
     const tx = calls[0]
-    expect(tx.channel).toBe('ch1')
+    expect(tx.eventId).toBe('event123')
+    expect(tx.channelId).toBe('security')
+    expect(typeof tx.clientId).toBe('string')
+    expect(typeof tx.relayId).toBe('string')
     expect(typeof tx.transmissionId).toBe('string')
     expect(tx.transmissionId.length).toBeGreaterThan(0)
-    expect(typeof tx.clientId).toBe('string')
     expect(tx.contentType).toBe('audio/mp4')
     expect(tx.size).toBe(deliveredMp4.length)
     expect(Buffer.isBuffer(tx.audio)).toBe(true)
     // persisted bytes are byte-for-byte what listeners received
     expect(Buffer.compare(tx.audio, deliveredMp4)).toBe(0)
-    expect(typeof tx.timestamp).toBe('number')
-    expect(typeof tx.duration).toBe('number')
+    expect(typeof tx.startedAt).toBe('number')
+    expect(typeof tx.endedAt).toBe('number')
+    expect(tx.endedAt).toBeGreaterThanOrEqual(tx.startedAt)
+    expect(tx.durationMs).toBe(tx.endedAt - tx.startedAt)
+
+    sender.close(); receiver.close()
+  })
+
+  it('defaults eventId when the sender does not send one', async () => {
+    const calls = []
+    const store = { kind: 'test', persist: async (tx) => { calls.push(tx) } }
+    await start(store)
+
+    const sender = await connect(port, { channelId: 'ch1' })
+    const receiver = await connect(port, { channelId: 'ch1' })
+    const incoming = nextMessages(receiver, 3)
+    await sendAudio(sender)
+    await incoming
+    await new Promise((r) => setTimeout(r, 50))
+
+    expect(calls).toHaveLength(1)
+    expect(typeof calls[0].eventId).toBe('string')
+    expect(calls[0].eventId.length).toBeGreaterThan(0)
 
     sender.close(); receiver.close()
   })
 
   it('does NOT block or break live fan-out when the writer hangs forever', async () => {
-    // persist never resolves — simulates a slow/stuck S3 or DynamoDB call
     const store = { kind: 'test', persist: () => deferred().promise }
     await start(store)
 
-    const sender = await connect(port, 'ch1')
-    const receiver = await connect(port, 'ch1')
+    const sender = await connect(port, { channelId: 'ch1' })
+    const receiver = await connect(port, { channelId: 'ch1' })
     const incoming = nextMessages(receiver, 3)
     await sendAudio(sender)
 
-    // fan-out (meta, binary mp4, end) must still arrive despite the stuck writer
     const msgs = await incoming
     expect(msgs).toHaveLength(3)
     expect(msgs.some((m) => m.isBinary)).toBe(true)
@@ -105,8 +124,8 @@ describe('store sidecar', () => {
     const store = { kind: 'test', persist: async () => { throw new Error('s3 exploded') } }
     await start(store)
 
-    const sender = await connect(port, 'ch1')
-    const receiver = await connect(port, 'ch1')
+    const sender = await connect(port, { channelId: 'ch1' })
+    const receiver = await connect(port, { channelId: 'ch1' })
     const incoming = nextMessages(receiver, 3)
     await sendAudio(sender)
 
@@ -122,8 +141,8 @@ describe('store sidecar', () => {
     const store = { kind: 'test', persist: () => { throw new Error('sync boom') } }
     await start(store)
 
-    const sender = await connect(port, 'ch1')
-    const receiver = await connect(port, 'ch1')
+    const sender = await connect(port, { channelId: 'ch1' })
+    const receiver = await connect(port, { channelId: 'ch1' })
     const incoming = nextMessages(receiver, 3)
     await sendAudio(sender)
 
@@ -131,5 +150,27 @@ describe('store sidecar', () => {
     expect(msgs).toHaveLength(3)
 
     sender.close(); receiver.close()
+  })
+
+  it('isolates fan-out by event: same channel name, different events do not cross-talk', async () => {
+    const store = { kind: 'test', persist: async () => {} }
+    await start(store)
+
+    const sender = await connect(port, { eventId: 'eventA', channelId: 'security' })
+    const sameEvent = await connect(port, { eventId: 'eventA', channelId: 'security' })
+    const otherEvent = await connect(port, { eventId: 'eventB', channelId: 'security' })
+
+    let otherGot = false
+    otherEvent.on('message', () => { otherGot = true })
+    const incoming = nextMessages(sameEvent, 3)
+
+    await sendAudio(sender)
+
+    const msgs = await incoming
+    expect(msgs).toHaveLength(3) // same-event peer hears it
+    await new Promise((r) => setTimeout(r, 200))
+    expect(otherGot).toBe(false) // other-event peer on the same channel name does not
+
+    sender.close(); sameEvent.close(); otherEvent.close()
   })
 })
