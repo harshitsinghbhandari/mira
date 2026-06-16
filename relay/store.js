@@ -19,6 +19,12 @@ import { createQueueFromEnv } from './queue.js'
 // Partitioned by the ownership boundary (event) then channel then UTC day, which
 // keeps prefixes scannable and makes per-event/-channel/-day retention easy.
 export function s3Key({ eventId, channelId, transmissionId, endedAt }) {
+  // endedAt is the date partition; guard it so a contract slip yields a clear
+  // error instead of a cryptic "Invalid time value" RangeError. (Any throw here
+  // is already caught by the relay's fire-and-forget .catch, never the channel.)
+  if (!Number.isFinite(endedAt)) {
+    throw new Error(`s3Key requires a valid endedAt timestamp (epoch ms), got: ${endedAt}`)
+  }
   const date = new Date(endedAt).toISOString().slice(0, 10)
   return `${eventId}/${channelId}/${date}/${transmissionId}.mp4`
 }

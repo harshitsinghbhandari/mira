@@ -31,6 +31,13 @@ describe('s3Key', () => {
   it('is event/channel/date/transmissionId.mp4, dated by endedAt', () => {
     expect(s3Key(sampleTx())).toBe(KEY)
   })
+
+  it('throws a descriptive error when endedAt is missing or invalid', () => {
+    expect(() => s3Key({ ...sampleTx(), endedAt: undefined })).toThrow(/endedAt/)
+    expect(() => s3Key({ ...sampleTx(), endedAt: null })).toThrow(/endedAt/)
+    expect(() => s3Key({ ...sampleTx(), endedAt: 'nope' })).toThrow(/endedAt/)
+    expect(() => s3Key({ ...sampleTx(), endedAt: NaN })).toThrow(/endedAt/)
+  })
 })
 
 describe('buildRecord', () => {
