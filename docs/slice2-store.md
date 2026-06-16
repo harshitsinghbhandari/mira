@@ -137,3 +137,10 @@ See `relay/.env.example`. Persistence is opt-in:
 The AWS SDK (S3, DynamoDB, SQS clients) is imported lazily — only when a real
 store/queue is built and a write actually happens — so the noop path never
 loads it.
+
+## Provisioning the AWS resources
+
+The bucket, table, and queue do not exist until you create them. Step-by-step
+AWS CLI commands (key schema, IAM policy, lifecycle, smoke tests) are in
+`architecture/aws-provisioning-store.md`. Until then the relay runs the no-op
+store and persists nothing.

@@ -333,5 +333,6 @@ creation) will build on next. The principle is the same at every layer: **voice
 is delivered first; everything else catches up behind it, and never the
 reverse.**
 
-See also: `docs/slice2-store.md` (slice summary), `architecture/ec2-relay-ops.md`
-(how the relay is deployed).
+See also: `docs/slice2-store.md` (slice summary),
+`architecture/aws-provisioning-store.md` (how to create the bucket/table/queue +
+IAM), `architecture/ec2-relay-ops.md` (how the relay is deployed).
