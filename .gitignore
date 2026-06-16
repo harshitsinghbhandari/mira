@@ -56,3 +56,5 @@ temp/
 *.p12
 *.pfx
 .vercel
+
+agent-orchestrator.yaml
