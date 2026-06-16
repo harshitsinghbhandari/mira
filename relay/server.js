@@ -1,5 +1,7 @@
 import { WebSocketServer, WebSocket } from 'ws'
 import { spawn } from 'child_process'
+import { randomUUID } from 'node:crypto'
+import { createStoreFromEnv } from './store.js'
 
 const log = (...a) => console.log(`[relay ${new Date().toISOString().slice(11, 23)}]`, ...a)
 
@@ -39,8 +41,12 @@ function transcode(chunks, tag) {
   })
 }
 
-export function createRelay(port) {
+export function createRelay(port, { store } = {}) {
   const channels = new Map()
+  // Persistence sidecar. Defaults to env config (noop unless a bucket+table are
+  // set), but is injectable for tests. It is ONLY ever called fire-and-forget,
+  // off the live fan-out path — see the 'end' handler below.
+  const persistStore = store ?? createStoreFromEnv()
   const wss = new WebSocketServer({ port })
 
   wss.on('connection', (ws, req) => {
@@ -48,6 +54,7 @@ export function createRelay(port) {
     let channelId = null
     let binCount = 0
     let binBytes = 0
+    let utteranceStart = null  // set on 'meta'; used to derive transmission duration
     const chunks = []  // binary chunks buffered from this sender
 
     log(`${id} CONNECTED from ${req?.socket?.remoteAddress ?? '?'} (total clients: ${wss.clients.size})`)
@@ -87,6 +94,7 @@ export function createRelay(port) {
           }
           log(`${id} forwarded meta to ${sent}/${peers.size - 1} peers`)
           binCount = 0; binBytes = 0  // reset counters for the new utterance
+          utteranceStart = Date.now()  // start of this transmission, for duration
 
         } else if (msg.type === 'end') {
           if (!channelId || chunks.length === 0) {
@@ -109,6 +117,28 @@ export function createRelay(port) {
               }
             }
             log(`${id} forwarded ${mp4.length}b mp4 + end to ${sent}/${peers.size - 1} peers`)
+
+            // --- Persistence sidecar (off the hot path) ---------------------
+            // Live fan-out above is already done. Hand the transmission to the
+            // writer WITHOUT awaiting it: Promise.resolve().then(...) defers it
+            // past this synchronous handler and .catch swallows any error (sync
+            // throw or rejection). A slow or failing S3/DynamoDB write therefore
+            // cannot backpressure, delay, or break the talking channel.
+            const now = Date.now()
+            const tx = {
+              channel: channelId,
+              transmissionId: randomUUID(),
+              clientId: id,
+              timestamp: now,
+              duration: utteranceStart ? now - utteranceStart : null,
+              contentType: 'audio/mp4',
+              size: mp4.length,
+              audio: mp4,
+            }
+            Promise.resolve()
+              .then(() => persistStore.persist(tx))
+              .then(() => log(`${id} persisted transmission ${tx.transmissionId} (${tx.size}b)`))
+              .catch((err) => log(`${id} PERSIST ERROR (ignored, channel unaffected): ${err.message}`))
           } catch (err) {
             log(`${id} TRANSCODE ERROR: ${err.message}`)
           }
